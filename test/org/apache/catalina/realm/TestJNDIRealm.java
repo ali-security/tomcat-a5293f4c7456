@@ -20,11 +20,16 @@ import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.Principal;
+import java.util.ArrayList;
+import java.util.Hashtable;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import javax.naming.AuthenticationException;
 import javax.naming.NamingEnumeration;
 import javax.naming.NamingException;
+import javax.naming.directory.Attributes;
 import javax.naming.directory.BasicAttributes;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.InitialDirContext;
@@ -60,6 +65,10 @@ public class TestJNDIRealm {
     // Not digested but doesn't matter for the purposes of the test
     private static final String DIGEST_A2 = "method:request-uri";
     public static final String USER_PASSWORD_ATTR = "test-pwd";
+
+    private static final String SIMPLE = "simple";
+    private static final String BIND_USER_PATTERN = "cn={0},ou=people,dc=example,dc=com";
+    private static final String BIND_USER_DN = "cn=" + USER + ",ou=people,dc=example,dc=com";
 
     private static MessageDigest md5Helper;
 
@@ -137,6 +146,84 @@ public class TestJNDIRealm {
     }
 
 
+    @Test
+    public void testBindAsUserAuthenticationNone() throws Exception {
+        doTestBindAsUser("none");
+    }
+
+
+    @Test
+    public void testBindAsUserAuthenticationExternal() throws Exception {
+        doTestBindAsUser("EXTERNAL");
+    }
+
+
+    @Test
+    public void testBindAsUserAuthenticationGssapi() throws Exception {
+        doTestBindAsUser("GSSAPI");
+    }
+
+
+    @Test
+    public void testBindAsUserAuthenticationSimple() throws Exception {
+        doTestBindAsUser("simple");
+    }
+
+
+    @Test
+    public void testBindAsUserAuthenticationDefault() throws Exception {
+        doTestBindAsUser(null);
+    }
+
+
+    private void doTestBindAsUser(String authentication) throws Exception {
+        Context context = new TesterContext();
+        JNDIRealm realm = new JNDIRealm();
+        realm.setContainer(context);
+        realm.setUserPattern(BIND_USER_PATTERN);
+        realm.setAuthentication(authentication);
+        // Logger is configured during init()
+        realm.init();
+
+        TesterBindDirContext dirContext = new TesterBindDirContext(realm.getDirectoryContextEnvironment());
+        // Usually everything is created in create() but that's not the case here
+        realm.singleConnection.context = dirContext;
+
+        realm.start();
+        try {
+            // An invalid password must never authenticate the user, regardless
+            // of the configured authentication mechanism
+            Assert.assertNull(realm.authenticate(USER, "wrong-" + PASSWORD));
+            assertBindEnvironmentRestored(dirContext, authentication);
+
+            // The valid password must still authenticate the user
+            Principal principal = realm.authenticate(USER, PASSWORD);
+            assertThat(principal, instanceOf(GenericPrincipal.class));
+            Assert.assertEquals(USER, principal.getName());
+            assertBindEnvironmentRestored(dirContext, authentication);
+
+            // Every bind as the user must have been a simple bind
+            Assert.assertEquals(2, dirContext.getBindMechanisms().size());
+            for (String mechanism : dirContext.getBindMechanisms()) {
+                Assert.assertEquals(SIMPLE, mechanism);
+            }
+        } finally {
+            realm.stop();
+        }
+    }
+
+
+    private void assertBindEnvironmentRestored(TesterBindDirContext dirContext, String authentication)
+            throws NamingException {
+        Hashtable<?,?> env = dirContext.getEnvironment();
+        // The configured authentication mechanism must have been restored
+        Assert.assertEquals(authentication, env.get(javax.naming.Context.SECURITY_AUTHENTICATION));
+        // The user's credentials must have been removed
+        Assert.assertFalse(env.containsKey(javax.naming.Context.SECURITY_PRINCIPAL));
+        Assert.assertFalse(env.containsKey(javax.naming.Context.SECURITY_CREDENTIALS));
+    }
+
+
     private JNDIRealm buildRealm(String password) throws NamingException,
             NoSuchFieldException, IllegalAccessException, LifecycleException {
         Context context = new TesterContext();
@@ -199,5 +286,66 @@ public class TestJNDIRealm {
     private String digestA1() {
         String a1 = USER + ":" + REALM + ":" + PASSWORD;
         return HexUtils.toHexString(md5Helper.digest(a1.getBytes()));
+    }
+
+
+    /*
+     * Simulates the bind behaviour of an LDAP server accessed via the JNDI LDAP
+     * provider. The provided credentials are only checked for a simple bind.
+     * Anonymous binds ("none") and SASL EXTERNAL binds ignore the password.
+     */
+    private static class TesterBindDirContext extends InitialDirContext {
+
+        private final Hashtable<Object,Object> env = new Hashtable<>();
+        private final List<String> bindMechanisms = new ArrayList<>();
+
+        TesterBindDirContext(Hashtable<String,String> env) throws NamingException {
+            // Lazy so no connection to a directory server is ever attempted
+            super(true);
+            this.env.putAll(env);
+        }
+
+        List<String> getBindMechanisms() {
+            return bindMechanisms;
+        }
+
+        @Override
+        public Hashtable<?,?> getEnvironment() throws NamingException {
+            return new Hashtable<>(env);
+        }
+
+        @Override
+        public Object addToEnvironment(String propName, Object propVal) throws NamingException {
+            return env.put(propName, propVal);
+        }
+
+        @Override
+        public Object removeFromEnvironment(String propName) throws NamingException {
+            return env.remove(propName);
+        }
+
+        @Override
+        public Attributes getAttributes(String name, String[] attrIds) throws NamingException {
+            Object mechanism = env.get(javax.naming.Context.SECURITY_AUTHENTICATION);
+            if (mechanism == null) {
+                // JNDI LDAP provider default
+                mechanism = env.containsKey(javax.naming.Context.SECURITY_CREDENTIALS) ? SIMPLE : "none";
+            }
+            bindMechanisms.add(mechanism.toString());
+            if (SIMPLE.equals(mechanism)) {
+                if (!BIND_USER_DN.equals(env.get(javax.naming.Context.SECURITY_PRINCIPAL)) ||
+                        !PASSWORD.equals(env.get(javax.naming.Context.SECURITY_CREDENTIALS))) {
+                    throw new AuthenticationException("Invalid credentials");
+                }
+            }
+            // "none" (anonymous) and "EXTERNAL" binds succeed without checking
+            // the password
+            return new BasicAttributes();
+        }
+
+        @Override
+        public void close() throws NamingException {
+            // NO-OP
+        }
     }
 }
