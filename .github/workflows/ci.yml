@@ -12,13 +12,15 @@
 
 name: Smoke Test
 
+# Sealed build: dispatch-only on the ali-security fork (push/pull_request
+# would fire on the fork sync push). test-filter narrows the Full_Tests legs.
 on:
-  push:
-    branches:
-      - 9.0.x
-  pull_request:
-    branches:
-      - 9.0.x
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated test class names (e.g. "TestRequest TestSsl"); empty = full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -37,6 +39,7 @@ jobs:
         os: [ ubuntu-latest ]
     name: JDK${{ matrix.java }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
     - name: Git Checkout
       uses: actions/checkout@v4
@@ -45,11 +48,19 @@ jobs:
       with:
         java-version: ${{ matrix.java }}
         distribution: zulu
+    # Sealed build: provide Tomcat Native so the JNI OpenSSL variants run
+    # instead of self-skipping (LD_LIBRARY_PATH feeds java.library.path).
+    - name: Set up Tomcat Native
+      run: bash .github/seal-native-setup.sh
     - name: Build
       run: |
         ant -noinput echoproperties deploy embed test-nio test-status
       env:
         ANT_OPTS: -Dtest.openssl.exists=false -Dtest.excludePerformance=true -Dtest.profile=smoke
+
+    - name: Test summary
+      if: ${{ !cancelled() }}
+      run: bash .github/seal-test-summary.sh output/build/logs
 
     - name: Upload logs
       if: ${{ !cancelled() }}
@@ -60,3 +71,86 @@ jobs:
           hs_err_*.log
           output/build/logs/TEST*.txt
         retention-days: 7
+
+  # Sealed build: upstream CI builds no release artifact. Build the embed jar
+  # with the toolchain recorded in build.properties.release (Adoptium JDK
+  # 25.0.4+7, Ant 1.10.17; both are embedded in the jar manifests) and upload it.
+  Release_Jar:
+    name: Release jar (tomcat-embed-core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v4
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '25.0.4+7.0.LTS'
+        distribution: temurin
+    - name: Set up Ant 1.10.17
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o ant.tar.gz https://archive.apache.org/dist/ant/binaries/apache-ant-1.10.17-bin.tar.gz
+        echo "a96ca6455ec9af5e702df7d1ed5a2ec1cfb381eac3e9a767ecb6be1706e826941045e8fd7ca663ba101bc47bfa18351f540dd27e9e7af57908ac78e65268eee7  ant.tar.gz" | sha512sum -c -
+        tar xzf ant.tar.gz
+        echo "$RUNNER_TEMP/apache-ant-1.10.17/bin" >> "$GITHUB_PATH"
+    - name: Build embed jars
+      run: |
+        ant -version
+        java -version
+        ant -noinput embed-jars
+        mkdir -p seal-dist
+        cp output/embed/tomcat-embed-core.jar seal-dist/tomcat-embed-core-9.0.121.jar
+        sha256sum seal-dist/*.jar
+    - name: Upload jar
+      uses: actions/upload-artifact@v4
+      with:
+        name: tomcat-embed-core-jar
+        path: seal-dist/tomcat-embed-core-9.0.121.jar
+        if-no-files-found: error
+
+  # Sealed build: upstream CI runs only the smoke profile. Run the full NIO
+  # suite (default test.name **/Test*.java, split by package so each leg fits
+  # the job budget) with Tomcat Native + OpenSSL 3.5.7, gated by test-status.
+  Full_Tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: catalina
+            pattern: 'org/apache/catalina/**/Test*.java'
+          - group: coyote
+            pattern: 'org/apache/coyote/**/Test*.java'
+          - group: tomcat
+            pattern: 'org/apache/tomcat/**/Test*.java'
+          - group: el-jasper-juli-naming-javax-util
+            pattern: 'org/apache/el/**/Test*.java,org/apache/jasper/**/Test*.java,org/apache/juli/**/Test*.java,org/apache/naming/**/Test*.java,javax/**/Test*.java,util/**/Test*.java'
+    name: Full tests NIO (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v4
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: 25
+        distribution: zulu
+    - name: Set up Tomcat Native
+      run: bash .github/seal-native-setup.sh
+    - name: Test
+      env:
+        ANT_OPTS: -Xmx2g
+        TEST_FILTER: ${{ inputs.test-filter }}
+        PATTERN: ${{ matrix.pattern }}
+      run: |
+        if [ -n "$TEST_FILTER" ]; then
+          PATTERN=$(for t in $TEST_FILTER; do printf '**/%s.java,' "$t"; done)
+          PATTERN=${PATTERN%,}
+        fi
+        echo "test.name=$PATTERN"
+        ant -noinput test-nio -Dtest.name="$PATTERN" -Dtest.threads=4 -Dtest.excludePerformance=true \
+          -Dtest.apr.loc="$SEAL_TCNATIVE_LIB" -Dtest.openssl.path="$SEAL_OPENSSL_BIN" test-status
+    - name: Test summary
+      if: ${{ !cancelled() }}
+      run: bash .github/seal-test-summary.sh output/build/logs
